@@ -8,10 +8,15 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 #[derive(Serialize, Deserialize)]
-enum DnsRequest { Get }
+enum DnsRequest {
+    Get,
+}
 
 #[derive(Serialize, Deserialize)]
-struct TakerHello { protocol_version_min: u32, protocol_version_max: u32 }
+struct TakerHello {
+    protocol_version_min: u32,
+    protocol_version_max: u32,
+}
 
 #[derive(Serialize, Deserialize)]
 struct GiveOffer;
@@ -31,16 +36,19 @@ enum MakerToTakerMessage {
 }
 
 #[derive(Serialize, Deserialize)]
-struct MakerHello { protocol_version_min: u32, protocol_version_max: u32 }
+struct MakerHello {
+    protocol_version_min: u32,
+    protocol_version_max: u32,
+}
 
 mod txid_serde {
     use serde::{Deserialize, Deserializer, Serializer};
     use serde_cbor::Value;
-    
+
     pub fn serialize<S: Serializer>(data: &str, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(data)
     }
-    
+
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
         match Value::deserialize(deserializer)? {
             Value::Text(s) => Ok(s),
@@ -80,7 +88,7 @@ struct FidelityProof {
 #[derive(Clone, Serialize, Deserialize)]
 struct Offer {
     base_fee: u64,
-    amount_relative_fee_pct: f64,  
+    amount_relative_fee_pct: f64,
     time_relative_fee_pct: f64,
     min_size: u64,
     max_size: u64,
@@ -127,20 +135,38 @@ fn read_msg(s: &mut impl Read) -> Result<Vec<u8>> {
 }
 
 fn handshake(s: &mut (impl Read + Write)) -> Result<()> {
-    send_msg(s, &TakerToMakerMessage::TakerHello(TakerHello { protocol_version_min: 1, protocol_version_max: 1 }))?;
+    send_msg(
+        s,
+        &TakerToMakerMessage::TakerHello(TakerHello {
+            protocol_version_min: 1,
+            protocol_version_max: 1,
+        }),
+    )?;
     let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_msg(s)?)?;
-    if let MakerToTakerMessage::MakerHello(_) = msg { Ok(()) } else { anyhow::bail!("Bad handshake") }
+    if let MakerToTakerMessage::MakerHello(_) = msg {
+        Ok(())
+    } else {
+        anyhow::bail!("Bad handshake")
+    }
 }
 
 fn fetch_dns() -> Result<Vec<MakerAddress>> {
-    for _ in 0..3 {
-        if let Ok(socks_conn) = Socks5Stream::connect("127.0.0.1:9050", "kizqnaslcb2r3mbk2vm77bdff3madcvddntmaaz2htmkyuw7sgh4ddqd.onion:8080") {
+    for i in 0..3 {
+        let target_addr = "kizqnaslcb2r3mbk2vm77bdff3madcvddntmaaz2htmkyuw7sgh4ddqd.onion:8080";
+        println!("Fetching DNS {target_addr}... Try {i}");
+        if let Ok(socks_conn) = Socks5Stream::connect("127.0.0.1:9050", target_addr) {
             let mut s = socks_conn.into_inner();
             send_msg(&mut s, &DnsRequest::Get)?;
             let resp: String = serde_cbor::from_slice(&read_msg(&mut s)?)?;
-            let addrs: Vec<MakerAddress> = resp.lines().filter_map(|line| {
-                line.split_once(':').map(|(addr, port)| MakerAddress { onion_addr: addr.to_string(), port: port.to_string() })
-            }).collect();
+            let addrs: Vec<MakerAddress> = resp
+                .lines()
+                .filter_map(|line| {
+                    line.split_once(':').map(|(addr, port)| MakerAddress {
+                        onion_addr: addr.to_string(),
+                        port: port.to_string(),
+                    })
+                })
+                .collect();
             return Ok(addrs);
         }
         thread::sleep(Duration::from_secs(5));
@@ -150,6 +176,7 @@ fn fetch_dns() -> Result<Vec<MakerAddress>> {
 
 fn get_offer(addr: &MakerAddress) -> Result<OfferAndAddress> {
     let addr_str = addr.to_string();
+    println!("Downloading offer from {addr_str}");
     let socks_conn = Socks5Stream::connect("127.0.0.1:9050", addr_str.as_str())?;
     let mut s = socks_conn.into_inner();
     handshake(&mut s)?;
@@ -159,7 +186,9 @@ fn get_offer(addr: &MakerAddress) -> Result<OfferAndAddress> {
         Ok(OfferAndAddress {
             offer: *offer,
             address: addr.clone(),
-            timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs(),
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs(),
         })
     } else {
         anyhow::bail!("Bad offer")
@@ -176,7 +205,7 @@ fn get_all_offers(addrs: &[MakerAddress]) -> Vec<OfferAndAddress> {
         });
     }
     drop(tx);
-    rx.iter().filter_map(|x| x).collect()
+    rx.iter().flatten().collect()
 }
 
 fn main() -> Result<()> {
@@ -185,34 +214,40 @@ fn main() -> Result<()> {
         if let Ok(addrs) = fetch_dns() {
             let offers = get_all_offers(&addrs);
             if !offers.is_empty() {
-                let json: Vec<serde_json::Value> = offers.iter().map(|o| {
-                    serde_json::json!({
-                        "address": o.address.to_string(),
-                        "timestamp": o.timestamp,
-                        "base_fee": o.offer.base_fee,
-                        "amount_relative_fee_pct": o.offer.amount_relative_fee_pct,
-                        "time_relative_fee_pct": o.offer.time_relative_fee_pct,
-                        "min_size": o.offer.min_size,
-                        "max_size": o.offer.max_size,
-                        "required_confirms": o.offer.required_confirms,
-                        "minimum_locktime": o.offer.minimum_locktime,
-                        "fidelity_bond": {
-                            "amount": o.offer.fidelity.bond.amount,
-                            "outpoint": {
-                                "txid": o.offer.fidelity.bond.outpoint.txid,
-                                "vout": o.offer.fidelity.bond.outpoint.vout
+                let json: Vec<serde_json::Value> = offers
+                    .iter()
+                    .map(|o| {
+                        serde_json::json!({
+                            "address": o.address.to_string(),
+                            "timestamp": o.timestamp,
+                            "base_fee": o.offer.base_fee,
+                            "amount_relative_fee_pct": o.offer.amount_relative_fee_pct,
+                            "time_relative_fee_pct": o.offer.time_relative_fee_pct,
+                            "min_size": o.offer.min_size,
+                            "max_size": o.offer.max_size,
+                            "required_confirms": o.offer.required_confirms,
+                            "minimum_locktime": o.offer.minimum_locktime,
+                            "fidelity_bond": {
+                                "amount": o.offer.fidelity.bond.amount,
+                                "outpoint": {
+                                    "txid": o.offer.fidelity.bond.outpoint.txid,
+                                    "vout": o.offer.fidelity.bond.outpoint.vout
+                                },
+                                "lock_time": o.offer.fidelity.bond.lock_time,
+                                "conf_height": o.offer.fidelity.bond.conf_height,
+                                "cert_expiry": o.offer.fidelity.bond.cert_expiry
                             },
-                            "lock_time": o.offer.fidelity.bond.lock_time,
-                            "conf_height": o.offer.fidelity.bond.conf_height,
-                            "cert_expiry": o.offer.fidelity.bond.cert_expiry
-                        },
-                        "tweakable_point": hex::encode(&o.offer.tweakable_point)
+                            "tweakable_point": hex::encode(&o.offer.tweakable_point)
+                        })
                     })
-                }).collect();
-                let _ = fs::write("../web/offer_data.json", serde_json::to_string_pretty(&json)?);
+                    .collect();
+                fs::write(
+                    "../web/offer_data.json",
+                    serde_json::to_string_pretty(&json)?,
+                )?;
                 println!("Updated with {} offers", offers.len());
             }
         }
-        thread::sleep(Duration::from_secs(30 * 60));
+        thread::sleep(Duration::from_secs(2 * 60));
     }
 }
