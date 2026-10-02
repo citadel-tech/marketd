@@ -1,37 +1,4 @@
 services:
-  bitcoind:
-    image: bitcoin/bitcoin:${BITCOIN_VERSION:-28}
-    network_mode: host
-    command:
-      - bitcoind
-      - -${BITCOIN_NETWORK:-signet}
-      - -rest
-      - -server
-      - -rpcbind=127.0.0.1
-      - -rpcallowip=127.0.0.1
-      - -rpcuser=${BITCOIN_RPC_USER:-user}
-      - -rpcpassword=${BITCOIN_RPC_PASS:-password}
-      - -rpcport=${BITCOIN_RPC_PORT:-38332}
-      - -zmqpubrawtx=tcp://127.0.0.1:${BITCOIN_ZMQ_PORT:-28332}
-      - -zmqpubrawblock=tcp://127.0.0.1:${BITCOIN_ZMQ_PORT:-28332}
-      - -txindex=1
-    volumes:
-      - bitcoin-data:/home/bitcoin/.bitcoin
-    healthcheck:
-      test:
-        - CMD
-        - bitcoin-cli
-        - -${BITCOIN_NETWORK:-signet}
-        - -rpcuser=${BITCOIN_RPC_USER:-user}
-        - -rpcpassword=${BITCOIN_RPC_PASS:-password}
-        - -rpcport=${BITCOIN_RPC_PORT:-38332}
-        - getblockchaininfo
-      interval: 30s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-
   tor:
     image: osminogin/tor-simple
     network_mode: host
@@ -51,7 +18,7 @@ services:
     volumes:
       - tor-data:/var/lib/tor
     environment:
-      - TOR_AUTH_PASSWORD=${TOR_AUTH_PASSWORD:?TOR_AUTH_PASSWORD is required}
+      - TOR_AUTH_PASSWORD=${TOR_AUTH_PASSWORD:-coinswapvps1111}
       - TOR_SOCKS_PORT=${TOR_SOCKS_PORT:-9050}
       - TOR_CONTROL_PORT=${TOR_CONTROL_PORT:-9051}
     healthcheck:
@@ -66,23 +33,34 @@ services:
     build: .
     network_mode: host
     environment:
-      - MARKETD_LISTEN_ADDR=0.0.0.0:${MARKETD_PORT:-3000}
-      - MARKETD_BITCOIN_RPC_URL=127.0.0.1:${BITCOIN_RPC_PORT:-38332}
-      - MARKETD_BITCOIN_RPC_USER=${BITCOIN_RPC_USER:-user}
-      - MARKETD_BITCOIN_RPC_PASS=${BITCOIN_RPC_PASS:-password}
-      - MARKETD_ZMQ_ADDR=tcp://127.0.0.1:${BITCOIN_ZMQ_PORT:-28332}
+      - MARKETD_LISTEN_ADDR=0.0.0.0:${MARKETD_PORT:-3005}
+      - MARKETD_HEALTHCHECK_PORT=${MARKETD_PORT:-3005}
+      # Existing Signet API: /api/makers, backed by the VPS Bitcoin Core.
+      - MARKETD_DATA_DIR=/var/lib/marketd/signet
+      - MARKETD_WALLET_NAME=${MARKETD_WALLET_NAME:-marketd-signet}
+      - MARKETD_BITCOIN_RPC_URL=${MARKETD_BITCOIN_RPC_URL:-127.0.0.1:${BITCOIN_RPC_PORT:-38332}}
+      - MARKETD_BITCOIN_RPC_USER=${BITCOIN_RPC_USER:-signet}
+      - MARKETD_BITCOIN_RPC_PASS=${BITCOIN_RPC_PASS:-signetpass}
+      - MARKETD_ZMQ_ADDR=${MARKETD_ZMQ_ADDR:-tcp://127.0.0.1:${BITCOIN_ZMQ_PORT:-28332}}
+      # Mainnet API: /api/mainnet/makers, backed by Electrum over Tor.
+      - MARKETD_MAINNET_DATA_DIR=/var/lib/marketd/mainnet
+      - MARKETD_MAINNET_WALLET_NAME=${MARKETD_MAINNET_WALLET_NAME:-marketd-mainnet}
+      - MARKETD_ELECTRUM_URL=${MARKETD_ELECTRUM_URL:-ssl://electrum.blockstream.info:50002}
+      - MARKETD_ELECTRUM_TOR=${MARKETD_ELECTRUM_TOR:-true}
       - MARKETD_TOR_CONTROL_PORT=${TOR_CONTROL_PORT:-9051}
-      - MARKETD_TOR_AUTH_PASSWORD=${TOR_AUTH_PASSWORD:?TOR_AUTH_PASSWORD is required}
-      - RUST_LOG=${RUST_LOG:-info}
+      - MARKETD_TOR_SOCKS_PORT=${TOR_SOCKS_PORT:-9050}
+      - MARKETD_TOR_AUTH_PASSWORD=${TOR_AUTH_PASSWORD:-coinswapvps1111}
+      - MARKETD_WALLET_PASSWORD=${MARKETD_WALLET_PASSWORD:-openswap}
+      - MARKETD_LOG_FILTER=${RUST_LOG:-info}
+    volumes:
+      - marketd-data:/var/lib/marketd
     depends_on:
-      bitcoind:
-        condition: service_healthy
       tor:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  bitcoin-data:
-    driver: local
   tor-data:
+    driver: local
+  marketd-data:
     driver: local

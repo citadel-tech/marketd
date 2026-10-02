@@ -79,7 +79,7 @@ pub fn send_to_address(bitcoind: &BitcoinD, addr: &Address, amount: Amount) -> T
         .unwrap()
 }
 
-/// Start a regtest `bitcoind` with the flags coinswap needs.
+/// Start a regtest `bitcoind` with the flags OpenSwap needs.
 ///
 /// Returns the running node (drop it to stop), the `host:port` RPC URL with
 /// the `http://` prefix stripped (the form `TakerInitConfig.rpc_config.url`
@@ -123,6 +123,13 @@ pub struct MarketdServerGuard {
 
 impl MarketdServerGuard {
     pub fn start(store: marketd::state::SharedStore) -> Self {
+        Self::start_dual(store, marketd::state::new_store())
+    }
+
+    pub fn start_dual(
+        signet_store: marketd::state::SharedStore,
+        mainnet_store: marketd::state::SharedStore,
+    ) -> Self {
         let port = free_port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
@@ -136,7 +143,11 @@ impl MarketdServerGuard {
                     .build()
                     .expect("tokio runtime");
                 rt.block_on(async move {
-                    let app = marketd::server::router(store, static_dir);
+                    let app = marketd::server::router_with_mainnet(
+                        signet_store,
+                        mainnet_store,
+                        static_dir,
+                    );
                     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
                         .await
                         .expect("bind test HTTP listener");

@@ -1,6 +1,6 @@
-use coinswap::{
+use openswap::{
     protocol::common_messages::Offer,
-    taker::offers::{MakerOfferCandidate, MakerProtocol, MakerState},
+    taker::offers::{BanReason, MakerOfferCandidate, MakerProtocol, MakerState, UnavailableReason},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
@@ -24,6 +24,9 @@ pub struct ApiFidelityBond {
 /// the maker's advertisement.
 #[derive(Serialize, Clone, Debug)]
 pub struct ApiOffer {
+    /// Public maker label. Older offers deserialize with an empty name, which
+    /// is exposed as `None` instead of an ambiguous empty string.
+    pub name: Option<String>,
     pub base_fee: u64,
     pub amount_relative_fee_pct: f64,
     pub time_relative_fee_pct: f64,
@@ -36,11 +39,12 @@ pub struct ApiOffer {
 }
 
 impl ApiOffer {
-    pub fn from_coinswap(offer: &Offer) -> Self {
+    pub fn from_openswap(offer: &Offer) -> Self {
         let bond = &offer.fidelity.bond;
         let outpoint = bond.outpoint();
 
         Self {
+            name: optional_maker_name(&offer.name),
             base_fee: offer.base_fee,
             amount_relative_fee_pct: offer.amount_relative_fee_pct,
             time_relative_fee_pct: offer.time_relative_fee_pct,
@@ -63,20 +67,88 @@ impl ApiOffer {
     }
 }
 
+fn optional_maker_name(name: &str) -> Option<String> {
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApiMakerState {
     Good,
-    Unresponsive { retries: u8 },
-    Bad,
+    Unavailable {
+        reason: ApiUnavailableReason,
+        since_ts: Option<u64>,
+        last_attempt_ts: Option<u64>,
+        attempts: u32,
+    },
+    Banned {
+        reason: ApiBanReason,
+        recorded_at_ts: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiUnavailableReason {
+    AwaitingOffer,
+    NoOfferResponse,
+    BondUnconfirmed,
+    BondExpired,
+    BondReorged,
+    BondUnverified,
+    UnpriceableOffer,
+    LegacyStatus,
+}
+
+impl From<&UnavailableReason> for ApiUnavailableReason {
+    fn from(reason: &UnavailableReason) -> Self {
+        match reason {
+            UnavailableReason::AwaitingOffer => Self::AwaitingOffer,
+            UnavailableReason::NoOfferResponse => Self::NoOfferResponse,
+            UnavailableReason::BondUnconfirmed => Self::BondUnconfirmed,
+            UnavailableReason::BondExpired => Self::BondExpired,
+            UnavailableReason::BondReorged => Self::BondReorged,
+            UnavailableReason::BondUnverified => Self::BondUnverified,
+            UnavailableReason::UnpriceableOffer => Self::UnpriceableOffer,
+            UnavailableReason::LegacyStatus => Self::LegacyStatus,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiBanReason {
+    ProvenViolation,
+    InvalidFidelityProof,
+    FundingWithheld,
+    LegacyProvenViolation,
+}
+
+impl From<&BanReason> for ApiBanReason {
+    fn from(reason: &BanReason) -> Self {
+        match reason {
+            BanReason::ProvenViolation => Self::ProvenViolation,
+            BanReason::InvalidFidelityProof => Self::InvalidFidelityProof,
+            BanReason::FundingWithheld => Self::FundingWithheld,
+            BanReason::LegacyProvenViolation => Self::LegacyProvenViolation,
+        }
+    }
 }
 
 impl From<&MakerState> for ApiMakerState {
     fn from(s: &MakerState) -> Self {
         match s {
             MakerState::Good => Self::Good,
-            MakerState::Unresponsive { retries } => Self::Unresponsive { retries: *retries },
-            MakerState::Bad => Self::Bad,
+            MakerState::Unavailable(unavailable) => Self::Unavailable {
+                reason: (&unavailable.reason).into(),
+                since_ts: unavailable.since_ts,
+                last_attempt_ts: unavailable.last_attempt_ts,
+                attempts: unavailable.attempts,
+            },
+            MakerState::Banned(ban) => Self::Banned {
+                reason: (&ban.reason).into(),
+                recorded_at_ts: ban.recorded_at_ts,
+            },
         }
     }
 }
@@ -90,8 +162,7 @@ fn protocol_label(p: &MakerProtocol) -> &'static str {
 }
 
 /// A maker known to the taker's offerbook — *whether or not* we have a
-/// current offer for it. Bad and unresponsive makers come through here too,
-/// with `offer: None`.
+/// current offer for it. Unavailable and banned makers come through here too.
 #[derive(Serialize, Clone, Debug)]
 pub struct ApiMaker {
     pub address: String,
@@ -112,7 +183,7 @@ impl ApiMaker {
             timestamp,
             last_offer_update_ts: candidate.last_offer_update_ts,
             next_offer_check_ts: candidate.next_offer_check_ts,
-            offer: candidate.offer.as_ref().map(ApiOffer::from_coinswap),
+            offer: candidate.offer.as_ref().map(ApiOffer::from_openswap),
         }
     }
 }
@@ -127,4 +198,15 @@ pub type SharedStore = Arc<RwLock<MakerStore>>;
 
 pub fn new_store() -> SharedStore {
     Arc::new(RwLock::new(MakerStore::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::optional_maker_name;
+
+    #[test]
+    fn legacy_empty_maker_name_becomes_none() {
+        assert_eq!(optional_maker_name(""), None);
+        assert_eq!(optional_maker_name("Alice"), Some("Alice".to_owned()));
+    }
 }

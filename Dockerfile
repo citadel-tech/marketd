@@ -7,7 +7,7 @@ COPY web/ ./
 RUN npm run build
 
 # Stage 2: build daemon
-FROM rust:1.88-slim AS builder
+FROM rust:1.90-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev libzmq3-dev cmake git ca-certificates gcc g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -31,11 +31,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /app/target/release/marketd /usr/local/bin/marketd
 COPY --from=frontend /app/dist /usr/share/marketd/web
 
-ENV MARKETD_LISTEN_ADDR=0.0.0.0:3000
+ENV MARKETD_LISTEN_ADDR=0.0.0.0:3005
+ENV MARKETD_HEALTHCHECK_PORT=3005
 ENV MARKETD_STATIC_DIR=/usr/share/marketd/web
-EXPOSE 3000
+EXPOSE 3005
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:3000/api/health || exit 1
+  CMD curl -fsS "http://127.0.0.1:${MARKETD_HEALTHCHECK_PORT}/api/health" || exit 1
 
 ENTRYPOINT ["marketd"]

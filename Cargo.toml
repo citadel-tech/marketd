@@ -2,13 +2,14 @@
 name = "marketd"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 
 [features]
 # Enable with: cargo test --features integration-test
-integration-test = ["coinswap/integration-test"]
+integration-test = ["openswap/integration-test"]
 
 [dependencies]
-coinswap = { git = "https://github.com/citadel-tech/coinswap", rev = "8d98134" }
+openswap = { git = "https://github.com/citadel-foss/openswap", branch = "master" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
@@ -21,7 +22,7 @@ serde_json = "1.0"
 serde_cbor = "0.11"
 hex = "0.4"
 bitcoind = "0.36"
-secp256k1 = { version = "0.32.0-beta.2", features = ["rand", "global-context"] }
+secp256k1 = { version = "0.33.0", features = ["rand", "global-context"] }
 
 [dev-dependencies]
 ureq = { version = "2", default-features = false, features = ["json"] }

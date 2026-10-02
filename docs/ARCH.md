@@ -1,20 +1,20 @@
 # marketd architecture
 
-`marketd` is a thin HTTP service that turns the coinswap network's live offerbook
+`marketd` is a thin HTTP service that turns the OpenSwap network's live offerbook
 into a JSON API and serves a React dashboard on top. It is a **read-only**
 aggregator, no swaps, no wallet operations, no maker-side logic. built on top
-of the [`coinswap`](https://github.com/citadel-tech/coinswap) `Taker` SDK.
+of the [`openswap`](https://github.com/citadel-foss/openswap) `Taker` SDK.
 
 ![Arch](./marketd-arch.png)
 
 ## What it does, in one paragraph
 
-Browsers ask `marketd` for a list of currently-good market offers. `marketd`
-keeps that list fresh by running coinswap's `Taker` in the background — which
-discovers makers via Nostr, validates their fidelity bonds against a Bitcoin
-node, and fetches each maker's offer over Tor. The result is cached in memory
-and served to the frontend as JSON. The UI is a Vite-built React SPA bundled
-into the same binary and served by `tower_http::ServeDir`.
+Browsers ask `marketd` for Signet or Mainnet maker snapshots. `marketd` keeps
+both fresh by running two OpenSwap `Taker`s in the background. Each discovers
+makers via Nostr, validates fidelity bonds against its own blockchain backend,
+and fetches offers over Tor. Signet uses Bitcoin Core RPC/ZMQ; Mainnet uses
+Electrum. The isolated results are cached in memory and served as JSON. The UI
+is a Vite-built React SPA with a network toggle.
 
 So most of `marketd`'s shape comes from the **dependencies it pulls in** rather
 than from `marketd` itself: a Bitcoin node (RPC + REST + ZMQ), a Tor daemon
@@ -24,24 +24,26 @@ than from `marketd` itself: a Bitcoin node (RPC + REST + ZMQ), a Tor daemon
 
 | Boundary                | Direction                          | Purpose                                                                                          |
 | ----------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------ |
-| **Browser <-> marketd** | bidirectional                      | HTTP - `GET /api/offers`, `GET /api/health`, plus the SPA assets                                 |
-| **marketd -> bitcoind** | outbound JSON-RPC + REST + ZMQ sub | Wallet init, blockchain info, fidelity bond UTXO checks                                          |
+| **Browser <-> marketd** | bidirectional                      | Signet and Mainnet maker/health APIs, plus the SPA assets                                         |
+| **marketd -> bitcoind** | outbound JSON-RPC + REST + ZMQ sub | Signet wallet init, blockchain info, fidelity bond UTXO checks                                    |
+| **marketd -> Electrum** | outbound SSL, optionally via Tor   | Mainnet chain sync and fidelity bond validation                                                    |
 | **marketd -> Tor**      | outbound (control + SOCKS5)        | Auth + circuit setup, then proxied connections to onion makers                                   |
 | **marketd -> Nostr**    | outbound WSS                       | Subscribe to fidelity announcements (`kind=37777`) on `wss://nos.lol` and `wss://relay.damus.io` |
 | **marketd -> makers**   | outbound, via Tor SOCKS5           | `GetOffer` request, receive `Offer` (fee schedule + fidelity bond)                               |
 
 ## Internal structure
 
-`marketd` runs **two threads** sharing one in-memory store:
+`marketd` runs an HTTP server and **two independent sync threads**, each with
+its own in-memory store and persisted OpenSwap data directory:
 
-1. **HTTP server:** `tokio` async runtime with `axum`. Serves the SPA and the
-   two API endpoints. Reads from the store; never blocks on the network.
-2. **Sync loop:** a blocking task spawned via `tokio::task::spawn_blocking`.
-   Owns a `coinswap::taker::Taker` instance and writes the store.
+1. **HTTP server:** `tokio` async runtime with `axum`. Serves the SPA and both
+   route groups. Reads from the selected store; never blocks on the network.
+2. **Signet sync loop:** owns a Bitcoin Core-backed `Taker`.
+3. **Mainnet sync loop:** owns an Electrum-backed `Taker`.
 
-The store is `Arc<RwLock<OfferStore>>`. The HTTP thread takes a read lock per
-request (cheap), the sync thread takes a write lock once per cycle (also cheap,
-because the lock is held only while the new `Vec<ApiOffer>` is moved in).
+Each store is an `Arc<RwLock<MakerStore>>`. The HTTP thread takes a read lock
+per request, and each sync thread takes a write lock only while publishing its
+new maker snapshot.
 
 `Taker::init` itself spawns more threads inside the sync thread's process: a
 `Watcher` thread (consumes Bitcoin ZMQ events, runs Nostr discovery), and an
@@ -53,12 +55,10 @@ treat these as opaque. `marketd` only calls `taker.run_offer_sync_now()` and
 
 ```
 1. Parse CLI / env config (clap)
-2. Spawn HTTP server (returns immediately, listens on 0.0.0.0:3000)
-3. Sync thread:
-   a. wait_for_tcp(bitcoin_rpc_url, "Bitcoin RPC")        // blocks until listening
-   b. wait_for_tcp("127.0.0.1:tor_control", "Tor control") // blocks until listening
-   c. Taker::init(...) in retry loop                       // wallet + ZMQ + Nostr + Tor
-   d. enter sync cycle (see below)
+2. Spawn the Signet and Mainnet sync threads
+3. Each thread waits for Tor; Signet also waits for Bitcoin Core RPC
+4. Each thread initializes its Taker in an independent retry loop
+5. Start the HTTP server (Docker listens on 0.0.0.0:3005)
 ```
 
 The `wait_for_tcp` step is critical: it uses **only the first resolved socket
@@ -73,40 +73,35 @@ open".
 
 ## Sync cycle
 
-Once `Taker` is initialised, the sync thread runs:
+Once a `Taker` is initialized, its sync thread runs:
 
 ```rust
 loop {
-    taker.run_offer_sync_now();                  // kick the OfferSyncService
-    while taker.is_offerbook_syncing() {         // wait for it to finish
-        thread::sleep(Duration::from_secs(1));
-    }
-    let book = taker.fetch_offers()?;            // snapshot the OfferBook
-    let offers = book.all_makers()
-        .into_iter()
-        .filter(|m| matches!(m.state, MakerState::Good))
-        .filter_map(|m| m.offer.as_ref()
-            .map(|o| ApiOffer::from_coinswap(o, &m.address, ts)))
+    taker.sync_offerbook_and_wait()?;
+    let book = taker.fetch_offers()?;
+    let makers = book.all_makers()
+        .iter()
+        .map(|maker| ApiMaker::from_candidate(maker, timestamp))
         .collect();
-    store.write().unwrap().offers = offers;      // publish atomically
+    store.write().unwrap().makers = makers;
     thread::sleep(Duration::from_secs(cfg.sync_interval_secs));
 }
 ```
 
-The transformation `MakerOfferCandidate -> ApiOffer` is in `state.rs`. It mostly
-copies fields, with one workaround: `FidelityBond::outpoint` is `pub(crate)` in
-the `coinswap` crate, so we round-trip through `serde_json::Value` to read
-`outpoint.txid` and `outpoint.vout`. Once that field is made `pub`, the
-workaround can be deleted.
+The transformation `MakerOfferCandidate -> ApiMaker` is in `state.rs`. Good,
+unavailable, and banned makers are all represented. Offers include the maker
+name; an empty legacy name is serialized as `null`.
 
 ---
 
 ## API surface
 
 ```
-GET /api/offers   ->  200  application/json   ApiOffer[]
-GET /api/health   ->  200  application/json   { status, offer_count, last_sync }
-GET /*            ->     SPA assets, with index.html as the SPA fallback
+GET /api/makers          -> Signet ApiMaker[] (Bitcoin Core)
+GET /api/health          -> Signet health
+GET /api/mainnet/makers  -> Mainnet ApiMaker[] (Electrum)
+GET /api/mainnet/health  -> Mainnet health
+GET /*                   -> SPA assets, with index.html as fallback
 ```
 
 `ApiOffer` (see `state.rs`):
@@ -137,17 +132,17 @@ GET /*            ->     SPA assets, with index.html as the SPA fallback
 
 ## Deployment
 
-Three containers, all on `network_mode: host` so they reach each other at
-`127.0.0.1:<port>`:
+Two containers use `network_mode: host`. Bitcoin Core is expected to already
+be running on the VPS host:
 
 | Service    | Image                  | Ports                           | Role                                            |
 | ---------- | ---------------------- | ------------------------------- | ----------------------------------------------- |
-| `bitcoind` | `bitcoin/bitcoin:28`   | 38332 (RPC + REST), 28332 (ZMQ) | `-rest -txindex=1 -zmqpubrawtx -zmqpubrawblock` |
 | `tor`      | `osminogin/tor-simple` | 9050 (SOCKS), 9051 (control)    | Hashed control password                         |
-| `marketd`  | this repo              | 3000 (HTTP)                     | Aggregator + SPA                                |
+| `marketd`  | this repo              | 3005 (HTTP)                     | Dual-network aggregator + SPA                   |
 
-`./run.sh dev` brings up all three; `./run.sh prod` runs an interactive wizard
-that lets you swap any of them for an external instance.
+`docker compose up -d --build` brings up Tor and Marketd. `./run.sh prod` is an
+interactive alternative for configuring the external Signet node, Mainnet
+Electrum server, and Tor.
 
 ---
 
@@ -156,7 +151,7 @@ that lets you swap any of them for an external instance.
 - **No wallet operations**, even though `Taker::init` creates a wallet file.
   The wallet is only needed to satisfy the `Taker` constructor — `marketd` never
   signs, spends, or holds keys you'd care about.
-- **No swap logic.** `do_coinswap`, `recover_from_swap`, etc. are unused.
-- **No persistence beyond the offerbook.** `~/.coinswap/marketd/offerbook.json`
+- **No swap logic.** OpenSwap execution and recovery APIs are unused.
+- **No persistence beyond the offerbook.** `~/.openswap/marketd/offerbook.json`
   is written by `Taker`'s background service; `marketd` itself keeps no state.
 - **No auth on `/api/*`.** It's a public read-only feed.

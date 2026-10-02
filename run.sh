@@ -11,12 +11,15 @@ CONFIG_FILE="$SCRIPT_DIR/.docker-config"
 DEFAULT_BITCOIN_NETWORK="signet"
 DEFAULT_BITCOIN_RPC_PORT="38332"
 DEFAULT_BITCOIN_ZMQ_PORT="28332"
-DEFAULT_BITCOIN_RPC_USER="user"
-DEFAULT_BITCOIN_RPC_PASS="password"
+DEFAULT_BITCOIN_RPC_USER="signet"
+DEFAULT_BITCOIN_RPC_PASS="signetpass"
 DEFAULT_TOR_SOCKS_PORT="9050"
 DEFAULT_TOR_CONTROL_PORT="9051"
-DEFAULT_TOR_AUTH_PASSWORD="coinswap"
-DEFAULT_MARKETD_PORT="3000"
+DEFAULT_TOR_AUTH_PASSWORD="openswap"
+DEFAULT_MARKETD_PORT="3005"
+DEFAULT_MARKETD_WALLET_NAME="marketd-signet"
+DEFAULT_MAINNET_WALLET_NAME="marketd-mainnet"
+DEFAULT_ELECTRUM_URL="ssl://electrum.blockstream.info:50002"
 
 #  colours 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -35,7 +38,10 @@ _CONFIG_KEYS=(
     BITCOIN_NETWORK BITCOIN_RPC_PORT BITCOIN_ZMQ_PORT
     BITCOIN_RPC_USER BITCOIN_RPC_PASS BITCOIN_RPC_HOST
     TOR_SOCKS_PORT TOR_CONTROL_PORT TOR_AUTH_PASSWORD
-    MARKETD_PORT USE_EXTERNAL_BITCOIND USE_EXTERNAL_TOR
+    MARKETD_PORT MARKETD_WALLET_PASSWORD MARKETD_WALLET_NAME
+    MARKETD_MAINNET_WALLET_NAME
+    MARKETD_ELECTRUM_URL MARKETD_ELECTRUM_TOR
+    USE_EXTERNAL_BITCOIND USE_EXTERNAL_TOR
 )
 
 load_config() {
@@ -86,12 +92,17 @@ load_config() {
     BITCOIN_ZMQ_PORT="${BITCOIN_ZMQ_PORT:-$DEFAULT_BITCOIN_ZMQ_PORT}"
     BITCOIN_RPC_USER="${BITCOIN_RPC_USER:-$DEFAULT_BITCOIN_RPC_USER}"
     BITCOIN_RPC_PASS="${BITCOIN_RPC_PASS:-$DEFAULT_BITCOIN_RPC_PASS}"
-    BITCOIN_RPC_HOST="${BITCOIN_RPC_HOST:-localhost:$BITCOIN_RPC_PORT}"
+    BITCOIN_RPC_HOST="${BITCOIN_RPC_HOST:-127.0.0.1:$BITCOIN_RPC_PORT}"
     TOR_SOCKS_PORT="${TOR_SOCKS_PORT:-$DEFAULT_TOR_SOCKS_PORT}"
     TOR_CONTROL_PORT="${TOR_CONTROL_PORT:-$DEFAULT_TOR_CONTROL_PORT}"
     TOR_AUTH_PASSWORD="${TOR_AUTH_PASSWORD:-$DEFAULT_TOR_AUTH_PASSWORD}"
     MARKETD_PORT="${MARKETD_PORT:-$DEFAULT_MARKETD_PORT}"
-    USE_EXTERNAL_BITCOIND="${USE_EXTERNAL_BITCOIND:-false}"
+    MARKETD_WALLET_PASSWORD="${MARKETD_WALLET_PASSWORD:-$TOR_AUTH_PASSWORD}"
+    MARKETD_WALLET_NAME="${MARKETD_WALLET_NAME:-$DEFAULT_MARKETD_WALLET_NAME}"
+    MARKETD_MAINNET_WALLET_NAME="${MARKETD_MAINNET_WALLET_NAME:-$DEFAULT_MAINNET_WALLET_NAME}"
+    MARKETD_ELECTRUM_URL="${MARKETD_ELECTRUM_URL:-$DEFAULT_ELECTRUM_URL}"
+    MARKETD_ELECTRUM_TOR="${MARKETD_ELECTRUM_TOR:-true}"
+    USE_EXTERNAL_BITCOIND="${USE_EXTERNAL_BITCOIND:-true}"
     USE_EXTERNAL_TOR="${USE_EXTERNAL_TOR:-false}"
 }
 
@@ -141,7 +152,11 @@ export_env() {
     export BITCOIN_NETWORK BITCOIN_RPC_PORT BITCOIN_ZMQ_PORT
     export BITCOIN_RPC_USER BITCOIN_RPC_PASS BITCOIN_RPC_HOST
     export TOR_SOCKS_PORT TOR_CONTROL_PORT TOR_AUTH_PASSWORD
-    export MARKETD_PORT
+    export MARKETD_PORT MARKETD_WALLET_PASSWORD MARKETD_WALLET_NAME
+    export MARKETD_MAINNET_WALLET_NAME
+    export MARKETD_ELECTRUM_URL MARKETD_ELECTRUM_TOR
+    export MARKETD_BITCOIN_RPC_URL="$BITCOIN_RPC_HOST"
+    export MARKETD_ZMQ_ADDR="tcp://127.0.0.1:$BITCOIN_ZMQ_PORT"
 }
 
 #  compose helpers 
@@ -154,41 +169,13 @@ compose_down() {
     docker compose -f "$SCRIPT_DIR/docker-compose.yml" down "$@"
 }
 
-wait_bitcoind_healthy() {
-    info "Waiting for bitcoind to become healthy (initial sync can take a while)…"
-    warn "Press Ctrl+C to stop watching – sync continues in the background."
-    echo ""
-    docker compose -f "$SCRIPT_DIR/docker-compose.yml" logs -f bitcoind &
-    local logs_pid=$!
-    trap 'kill "$logs_pid" 2>/dev/null; trap - INT TERM EXIT' INT TERM EXIT
-
-    while true; do
-        sleep 30
-        local status
-        status=$(docker compose -f "$SCRIPT_DIR/docker-compose.yml" \
-            exec -T bitcoind bitcoin-cli \
-            "-${BITCOIN_NETWORK}" \
-            "-rpcuser=${BITCOIN_RPC_USER}" \
-            "-rpcpassword=${BITCOIN_RPC_PASS}" \
-            "-rpcport=${BITCOIN_RPC_PORT}" \
-            getblockchaininfo 2>/dev/null \
-            | grep -o '"initialblockdownload":[^,]*' | cut -d: -f2 | tr -d ' ' || true)
-
-        [[ "$status" == "false" ]] && break
-    done
-
-    kill "$logs_pid" 2>/dev/null || true
-    trap - INT TERM EXIT
-    success "Bitcoin node synced."
-}
-
 #  dev mode 
 cmd_dev() {
     header "Dev mode – starting all services"
     check_docker
     load_config
     export_env
-    compose_up_services bitcoind tor marketd
+    compose_up_services tor marketd
     success "All services started."
     docker compose -f "$SCRIPT_DIR/docker-compose.yml" ps
 }
@@ -197,37 +184,24 @@ cmd_dev() {
 configure_prod() {
     header "Production setup"
 
-    #  network 
-    header "Bitcoin network"
-    echo "  1) Signet  (default, where coinswap operates)"
-    echo "  2) Mainnet"
-    local net_choice
-    read -rp "  Choice [1]: " net_choice
-    case "${net_choice:-1}" in
-        2) BITCOIN_NETWORK="mainnet";  BITCOIN_RPC_PORT="8332" ;;
-        *) BITCOIN_NETWORK="signet";   BITCOIN_RPC_PORT="38332" ;;
-    esac
+    #  signet bitcoin core backend
+    header "Signet Bitcoin Core"
+    USE_EXTERNAL_BITCOIND="true"
+    prompt BITCOIN_RPC_HOST "RPC host:port" "127.0.0.1:$BITCOIN_RPC_PORT"
+    prompt BITCOIN_RPC_USER "RPC user" "$DEFAULT_BITCOIN_RPC_USER"
+    prompt_secret BITCOIN_RPC_PASS "RPC password" "$DEFAULT_BITCOIN_RPC_PASS"
     prompt BITCOIN_ZMQ_PORT "ZMQ port" "$DEFAULT_BITCOIN_ZMQ_PORT"
+    warn "Make sure the Signet node is running with -rest and -txindex=1."
 
-    #  bitcoin node 
-    header "Bitcoin node"
-    echo "  1) Run bitcoind in Docker  (quick start, syncs from scratch)"
-    echo "  2) Use an existing bitcoind  (requires -rest and -txindex=1)"
-    local btc_choice
-    read -rp "  Choice [1]: " btc_choice
-
-    if [[ "${btc_choice:-1}" == "2" ]]; then
-        USE_EXTERNAL_BITCOIND="true"
-        prompt  BITCOIN_RPC_HOST "RPC host:port"  "localhost:$BITCOIN_RPC_PORT"
-        prompt  BITCOIN_RPC_USER "RPC user"        "$DEFAULT_BITCOIN_RPC_USER"
-        prompt_secret BITCOIN_RPC_PASS "RPC password" "$DEFAULT_BITCOIN_RPC_PASS"
-        warn "Make sure bitcoind is running with -rest and -txindex=1."
+    #  mainnet electrum backend
+    header "Mainnet Electrum"
+    prompt MARKETD_ELECTRUM_URL "Electrum URL" "$DEFAULT_ELECTRUM_URL"
+    local electrum_tor_choice
+    read -rp "  Route Electrum through Tor? [Y/n]: " electrum_tor_choice
+    if [[ "${electrum_tor_choice,,}" == "n" ]]; then
+        MARKETD_ELECTRUM_TOR="false"
     else
-        USE_EXTERNAL_BITCOIND="false"
-        BITCOIN_RPC_HOST="localhost:$BITCOIN_RPC_PORT"
-        prompt  BITCOIN_RPC_PORT "RPC port"        "$BITCOIN_RPC_PORT"
-        prompt  BITCOIN_RPC_USER "RPC user"        "$DEFAULT_BITCOIN_RPC_USER"
-        prompt_secret BITCOIN_RPC_PASS "RPC password" "$DEFAULT_BITCOIN_RPC_PASS"
+        MARKETD_ELECTRUM_TOR="true"
     fi
 
     #  tor 
@@ -266,18 +240,22 @@ configure_prod() {
     #  marketd 
     header "marketd"
     prompt MARKETD_PORT "HTTP port" "$DEFAULT_MARKETD_PORT"
+    prompt MARKETD_WALLET_NAME "Signet wallet name" "$DEFAULT_MARKETD_WALLET_NAME"
+    prompt MARKETD_MAINNET_WALLET_NAME "Mainnet wallet name" "$DEFAULT_MAINNET_WALLET_NAME"
 
     #  summary 
     header "Summary"
-    echo "  Bitcoin network     : $BITCOIN_NETWORK"
-    echo "  Bitcoin node        : $([ "$USE_EXTERNAL_BITCOIND" == "true" ] && echo "external ($BITCOIN_RPC_HOST)" || echo "Docker")"
-    echo "  Bitcoin RPC port    : $BITCOIN_RPC_PORT"
-    echo "  Bitcoin ZMQ port    : $BITCOIN_ZMQ_PORT"
-    echo "  Bitcoin RPC user    : $BITCOIN_RPC_USER"
+    echo "  Signet backend      : Bitcoin Core ($BITCOIN_RPC_HOST)"
+    echo "  Signet RPC user     : $BITCOIN_RPC_USER"
+    echo "  Signet ZMQ port     : $BITCOIN_ZMQ_PORT"
+    echo "  Mainnet backend     : Electrum ($MARKETD_ELECTRUM_URL)"
+    echo "  Electrum over Tor   : $MARKETD_ELECTRUM_TOR"
     echo "  Tor                 : $([ "$USE_EXTERNAL_TOR" == "true" ] && echo "external" || echo "Docker")"
     echo "  Tor SOCKS port      : $TOR_SOCKS_PORT"
     echo "  Tor control port    : $TOR_CONTROL_PORT"
     echo "  marketd HTTP port   : $MARKETD_PORT"
+    echo "  Signet wallet       : $MARKETD_WALLET_NAME"
+    echo "  Mainnet wallet      : $MARKETD_MAINNET_WALLET_NAME"
     echo ""
 
     confirm "Save and start?" || { info "Aborted."; exit 0; }
@@ -303,13 +281,8 @@ cmd_prod() {
 
     local services=()
 
-    if [[ "$USE_EXTERNAL_BITCOIND" == "false" ]]; then
-        services+=(bitcoind)
-    else
-        info "Skipping bitcoind – using external node at $BITCOIN_RPC_HOST"
-        # Override RPC URL to point at external host
-        export MARKETD_BITCOIN_RPC_URL="$BITCOIN_RPC_HOST"
-    fi
+    info "Using external Signet node at $BITCOIN_RPC_HOST"
+    info "Using Mainnet Electrum at $MARKETD_ELECTRUM_URL"
 
     if [[ "$USE_EXTERNAL_TOR" == "false" ]]; then
         services+=(tor)
@@ -321,10 +294,6 @@ cmd_prod() {
         info "Starting infrastructure: ${services[*]}"
         compose_up_services "${services[@]}"
 
-        # Wait for bitcoind if we started it
-        if [[ " ${services[*]} " == *" bitcoind "* ]]; then
-            wait_bitcoind_healthy
-        fi
     fi
 
     info "Starting marketd…"
@@ -349,7 +318,6 @@ cmd_start() {
     export_env
 
     local services=(marketd)
-    [[ "$USE_EXTERNAL_BITCOIND" == "false" ]] && services=(bitcoind "${services[@]}")
     [[ "$USE_EXTERNAL_TOR"      == "false" ]] && services=(tor "${services[@]}")
 
     compose_up_services "${services[@]}"
@@ -388,11 +356,12 @@ cmd_help() {
 ${BOLD}marketd – docker management script${NC}
 
 ${BOLD}MODES${NC}
-  dev          Start all services (bitcoind + tor + marketd) for local development.
+  dev          Start Tor and marketd for local development.
                Uses built-in defaults – no prompts.
 
   prod         Interactive production wizard. Prompts for configuration,
-               lets you skip bitcoind or tor if you have existing ones,
+               configures an existing Signet Bitcoin Core, Mainnet Electrum,
+               and either Docker or external Tor,
                then starts the configured services.
 
 ${BOLD}OTHER COMMANDS${NC}
@@ -400,7 +369,7 @@ ${BOLD}OTHER COMMANDS${NC}
   start        Start services using the saved config (must run prod first).
   stop         Stop all running services.
   restart      Stop then start.
-  logs [svc]   Stream logs. Optionally filter to a service (bitcoind|tor|marketd).
+  logs [svc]   Stream logs. Optionally filter to a service (tor|marketd).
   status       Show running container status.
   help         Show this message.
 

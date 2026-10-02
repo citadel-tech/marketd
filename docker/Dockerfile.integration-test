@@ -2,7 +2,7 @@ FROM rust:1.90-slim-trixie
 
 # System dependencies. Mirrors maker-dashboard's integration-test image
 # (so the two crates share one tested apt list) plus libzmq3-dev which
-# coinswap's wallet links against.
+# OpenSwap's wallet links against.
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \

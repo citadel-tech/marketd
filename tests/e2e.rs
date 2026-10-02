@@ -35,20 +35,20 @@ use bitcoind::bitcoincore_rpc::{
     Auth,
     bitcoin::{Amount, Network},
 };
-use coinswap::{
+use marketd::{state::new_store, sync::sync_loop};
+use openswap::{
     maker::{MakerBehavior, MakerServer, MakerServerConfig, start_server},
     protocol::ProtocolVersion,
     taker::{Taker, TakerInitConfig, api::ConnectionType},
-    wallet::{AddressType, RPCConfig},
+    wallet::{AddressType, BackendConfig, CoreRpcConfig},
 };
-use marketd::{state::new_store, sync::sync_loop};
 use serde_json::Value;
 
 const NOSTR_RELAY: &str = "ws://127.0.0.1:8000";
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,coinswap=info")
+        .with_env_filter("info,openswap=info")
         .try_init();
 }
 
@@ -61,17 +61,18 @@ fn taker_init_and_http_layer_against_regtest() {
 
     let init_config = TakerInitConfig {
         data_dir: Some(tmp.path().join("taker")),
-        wallet_file_name: Some("marketd-init-test-wallet".into()),
-        rpc_config: Some(RPCConfig {
+        wallet_name: "marketd-init-test-wallet".into(),
+        backend: BackendConfig::CoreRpc(CoreRpcConfig {
             url: rpc_url,
             auth: Auth::UserPass(creds.user.clone(), creds.pass.clone()),
             wallet_name: "marketd-init-test-wallet".into(),
+            zmq_addr,
         }),
         control_port: None,
         tor_auth_password: None,
         socks_port: 0,
-        zmq_addr,
-        password: None,
+        check_blocklist: None,
+        password: Some("integration-test".into()),
         connection_type: ConnectionType::Clearnet,
         nostr_relays: vec![],
     };
@@ -112,11 +113,12 @@ fn maker_offer_flows_through_to_api_offers() {
     let (bitcoind, rpc_url, zmq_addr, creds) = common::init_bitcoind(tmp.path());
     let bitcoind = Arc::new(bitcoind);
 
-    let rpc_config = RPCConfig {
+    let rpc_config = CoreRpcConfig {
         url: rpc_url.clone(),
         auth: Auth::UserPass(creds.user.clone(), creds.pass.clone()),
         // wallet_name is overwritten per-component by their init paths.
         wallet_name: "placeholder".into(),
+        zmq_addr: zmq_addr.clone(),
     };
 
     // ───────── Maker ─────────
@@ -131,20 +133,24 @@ fn maker_offer_flows_through_to_api_offers() {
         base_fee: 1000,
         amount_relative_fee_pct: 0.025,
         time_relative_fee_pct: 0.001,
-        min_swap_amount: 10_000,
         required_confirms: 1,
+        check_blocklist: false,
         supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
-        zmq_addr: zmq_addr.clone(),
         fidelity_amount: 5_000_000,
         fidelity_timelock: 950,
+        fidelity_feerate: MakerServerConfig::default().fidelity_feerate,
         network: Network::Regtest,
         wallet_name: maker_wallet.clone(),
-        rpc_config: rpc_config.clone(),
+        backend: BackendConfig::CoreRpc(CoreRpcConfig {
+            wallet_name: maker_wallet.clone(),
+            ..rpc_config.clone()
+        }),
         control_port: 0,
         socks_port: 0,
         tor_auth_password: String::new(),
-        password: None,
+        password: Some("integration-test".into()),
         nostr_relays: vec![NOSTR_RELAY.into()],
+        name: "marketd-test-maker".into(),
     };
 
     let mut maker = MakerServer::init(maker_config).expect("MakerServer::init");
@@ -167,7 +173,7 @@ fn maker_offer_flows_through_to_api_offers() {
         .wallet
         .write()
         .expect("maker wallet write lock")
-        .sync_and_save()
+        .sync_and_save(&AtomicBool::new(false))
         .expect("sync_and_save after funding");
 
     // Background block generation. Confirms the fidelity bond tx and keeps
@@ -212,16 +218,16 @@ fn maker_offer_flows_through_to_api_offers() {
     let store = new_store();
     let taker_config = TakerInitConfig {
         data_dir: Some(tmp.path().join("marketd-taker")),
-        wallet_file_name: Some("marketd-taker-wallet".into()),
-        rpc_config: Some(RPCConfig {
+        wallet_name: "marketd-taker-wallet".into(),
+        backend: BackendConfig::CoreRpc(CoreRpcConfig {
             wallet_name: "marketd-taker-wallet".into(),
             ..rpc_config.clone()
         }),
         control_port: None,
         tor_auth_password: None,
         socks_port: 0,
-        zmq_addr: zmq_addr.clone(),
-        password: None,
+        check_blocklist: None,
+        password: Some("integration-test".into()),
         connection_type: ConnectionType::Clearnet,
         nostr_relays: vec![NOSTR_RELAY.into()],
     };
@@ -261,8 +267,9 @@ fn maker_offer_flows_through_to_api_offers() {
     assert_eq!(maker_json["address"], format!("127.0.0.1:{maker_net_port}"));
     assert_eq!(maker_json["state"]["kind"], "good");
     let offer = &maker_json["offer"];
+    assert_eq!(offer["name"], "marketd-test-maker");
     assert_eq!(offer["base_fee"], 1000);
-    assert_eq!(offer["min_size"], 10_000);
+    assert!(offer["min_size"].as_u64().is_some_and(|min| min > 0));
     assert_eq!(offer["required_confirms"], 1);
     assert!(
         offer["fidelity_bond"]["amount"].as_u64().unwrap() >= 5_000_000,
